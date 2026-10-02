@@ -1,0 +1,30 @@
+public class EvenCounter {
+
+    public int countEven(int[] numbers) {
+        int count = 0;
+
+        for (int number : numbers) {
+            if (number % 2 == 0) {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    public int countEvenLimited(int[] numbers) {
+        int count = 0;
+
+        for (int number : numbers) {
+            if (number % 2 == 0) {
+                count++;
+            }
+        }
+
+        if (count > 10) {
+            count = 10;
+        }
+
+        return count;
+    }
+}
