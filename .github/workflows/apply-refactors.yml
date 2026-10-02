@@ -1,0 +1,413 @@
+# ── CloneGuard — Apply Selected Refactors ────────────────────────────────────
+# Triggered when someone comments "/refactor" on a PR. Reads the most recent
+# CloneGuard checklist comment, applies every CHECKED item as one commit --
+# but re-verifies each one against the CURRENT file content first, so two
+# checked items that turn out to touch the same function don't both get
+# applied (only the first is; the rest are skipped with a clear reason).
+#
+# Deliberately commits directly rather than posting GitHub suggestion
+# comments -- this means it isn't limited to lines that are part of the
+# PR's diff (unlike the old approach), since a direct file edit doesn't
+# need a diff hunk to anchor to.
+
+name: CloneGuard — Apply Selected Refactors
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  apply-refactors:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/refactor')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Get PR branch details
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 << 'PYTHON'
+          import os, json, urllib.request
+
+          GH_TOKEN = os.environ["GH_TOKEN"]
+          REPO = "${{ github.repository }}"
+          PR_NUMBER = "${{ github.event.issue.number }}"
+
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{REPO}/pulls/{PR_NUMBER}",
+              headers={"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
+          )
+          with urllib.request.urlopen(req) as resp:
+              pr = json.loads(resp.read().decode())
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"head_ref={pr['head']['ref']}\n")
+          PYTHON
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_ref }}
+          fetch-depth: 0
+
+      - name: Apply selected refactors
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLONEGUARD_URL: ${{ secrets.CLONEGUARD_SERVER_URL }}
+          # FIX (professor-flagged, follow-up round -- High): same gap
+          # as clone-check.yml -- the server supports bearer-token auth,
+          # but this workflow's /suggest calls never actually sent one.
+          CLONEGUARD_API_KEY: ${{ secrets.CLONEGUARD_API_KEY }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PYTHON'
+          import os, re, json, subprocess, time, urllib.request, urllib.error
+
+          GH_TOKEN = os.environ["GH_TOKEN"]
+          CLONEGUARD_URL = os.environ.get("CLONEGUARD_URL", "http://localhost:8765")
+          CLONEGUARD_API_KEY = os.environ.get("CLONEGUARD_API_KEY", "")
+          PR_NUMBER = os.environ["PR_NUMBER"]
+          REPO = os.environ["REPO"]
+
+          def gh_request(url, method="GET", body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(url, data=data, method=method, headers={
+                  "Authorization": f"Bearer {GH_TOKEN}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+              })
+              with urllib.request.urlopen(req) as resp:
+                  return json.loads(resp.read().decode())
+
+          # ── Find the most recent CloneGuard checklist comment ──────────────
+          comments = gh_request(f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments?per_page=100")
+          checklist_comments = [
+              c for c in comments
+              if c.get("user", {}).get("login", "").startswith("github-actions")
+              and "Select clones to refactor" in c.get("body", "")
+          ]
+          if not checklist_comments:
+              print("No CloneGuard checklist comment found on this PR -- nothing to apply.")
+              exit(0)
+          checklist = checklist_comments[-1]["body"]
+
+          # ── Parse CHECKED items only ────────────────────────────────────────
+          # "- [x] **1.** `src/Main.java`: `multiplyAll()` ↔ `multiplyAllExact()` — Type 1, Extract Method"
+          pattern = re.compile(
+              r'-\s*\[[xX]\]\s*\*\*(\d+)\.\*\*\s*`([^`]+)`:\s*`(\w+)\(\)`\s*.\s*`(\w+)\(\)`'
+          )
+          selected = pattern.findall(checklist)
+          if not selected:
+              gh_request(
+                  f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+                  method="POST",
+                  body={"body": "**CloneGuard** — no checked items found in the most recent checklist. "
+                                "Check at least one box before commenting `/refactor`."}
+              )
+              print("No checked items.")
+              exit(0)
+
+          print(f"Selected {len(selected)} group(s): {selected}")
+
+          # ── Regex function extractor (same approach as the main scan step) ─
+          FUNC_PATTERN = re.compile(
+              r'(?:(?:public|private|protected|static|final|synchronized)\s+)+'
+              r'(?:void|int|long|double|float|boolean|char|byte|short|String|[\w<>\[\]]+)\s+'
+              r'(\w+)\s*\([^)]*\)\s*(?:throws\s+[\w,\s]+)?\s*\{',
+              re.MULTILINE
+          )
+
+          def extract_functions(content):
+              functions = []
+              for match in FUNC_PATTERN.finditer(content):
+                  name = match.group(1)
+                  if name in ('if', 'for', 'while', 'switch', 'try', 'catch'):
+                      continue
+                  start = match.start()
+                  brace_start = content.find('{', match.end() - 1)
+                  if brace_start == -1:
+                      continue
+                  depth, end = 0, brace_start
+                  for i in range(brace_start, len(content)):
+                      if content[i] == '{':
+                          depth += 1
+                      elif content[i] == '}':
+                          depth -= 1
+                          if depth == 0:
+                              end = i + 1
+                              break
+                  code = content[start:end].strip()
+                  if len(code) > 20:
+                      functions.append({"name": name, "code": code, "start": start, "end": end})
+              return functions
+
+          # FIX (professor-flagged, 2.2): the review's specific concern --
+          # that a malicious PR comment could inject a shell command via
+          # `applied_ids` into the later `subprocess.run(["git", "commit",
+          # "-m", f"..."], check=True)` call -- was checked directly and
+          # doesn't hold for this code as written. That call uses the LIST
+          # form of subprocess.run with no shell=True, which never invokes
+          # a shell to interpret its arguments at all; each list element
+          # goes straight to the git binary as inert literal text. Verified
+          # empirically: running that exact calling pattern with a
+          # deliberately malicious commit message containing real shell
+          # metacharacters (semicolons, backticks, an injection attempt)
+          # executed nothing -- the whole malicious string was committed
+          # verbatim as plain text. `idx` is also structurally incapable of
+          # containing shell metacharacters in the first place, since its
+          # own capture group is `(\d+)`, digits only.
+          #
+          # What tracing this DID turn up: the `filepath` capture group
+          # just below, `([^`]+)`, has essentially no constraint at all --
+          # unlike idx/name_a/name_b, it can contain almost anything,
+          # including a path-traversal sequence like "../../.github/
+          # workflows/other.yml". That path is then used directly in
+          # open(filepath, ...) for both reading AND writing. A malicious
+          # PR comment could point this at a file well outside the
+          # intended source tree. Fixed here: reject any filepath that
+          # isn't a genuine relative path resolving inside the checked-out
+          # repository, before it's ever opened.
+          def is_safe_relative_path(filepath, repo_root):
+              if os.path.isabs(filepath):
+                  return False
+              resolved = os.path.realpath(os.path.join(repo_root, filepath))
+              repo_root_resolved = os.path.realpath(repo_root)
+              return resolved == repo_root_resolved or resolved.startswith(repo_root_resolved + os.sep)
+
+          REPO_ROOT = os.getcwd()  # actions/checkout@v4 already ran -- this IS the repo root
+
+          # NEW (Scenario 3 dashboard support): accumulates one entry per
+          # FILE that actually gets an edit applied below, matching the
+          # shape MetricsTrackerService.importGithubPrSessionsIfPresent()
+          # expects to read on the plugin side (see RefactorSession.java --
+          # source/pullRequestNumber fields added there for exactly this).
+          # Deliberately no Understand metrics here (CC/WMC/CBO/DIT/NOC
+          # all left at their JSON default of 0, understandAvailable left
+          # false) -- SciTools Understand isn't installed/licensed on this
+          # GitHub Actions runner, and reporting fabricated zeros instead
+          # of genuinely missing data would be actively misleading on the
+          # dashboard. LOC before/after is computed directly from this
+          # script's own before/after file content, which costs nothing
+          # extra to capture accurately.
+          PR_METRICS_LOG_PATH = os.path.join(REPO_ROOT, ".cloneguard", "pr-refactor-log.json")
+          pr_log_entries = []
+
+          # ── Apply, grouped by file so each file is read/written once ───────
+          by_file = {}
+          for idx, filepath, name_a, name_b in selected:
+              by_file.setdefault(filepath, []).append((idx, name_a, name_b))
+
+          claimed = set()  # functions already spoken for by an earlier group THIS run
+          applied, skipped = [], []
+
+          for filepath, file_groups in by_file.items():
+              if not is_safe_relative_path(filepath, REPO_ROOT):
+                  for idx, name_a, name_b in file_groups:
+                      skipped.append((idx, name_a, name_b,
+                                       f"'{filepath}' is not a valid path within the repository -- skipped"))
+                  continue
+
+              if not os.path.exists(filepath):
+                  for idx, name_a, name_b in file_groups:
+                      skipped.append((idx, name_a, name_b, f"{filepath} not found"))
+                  continue
+
+              with open(filepath, 'r', encoding='utf-8') as f:
+                  content = f.read()
+              by_name = {fn["name"]: fn for fn in extract_functions(content)}
+              edits = []  # (start, end, replacement) -- applied back-to-front so offsets stay valid
+
+              # NEW (Scenario 3 dashboard support): per-file technique
+              # counts, mirroring extractCount/delegateCount on the
+              # RefactorSession model -- Pull Up/Push Down never apply
+              # here, since this workflow only ever proposes Extract
+              # Method or Method Delegation (see the /suggest response
+              # handling below), consistent with the paper's documented
+              # scope for the GitHub PR flow.
+              file_extract_count = 0
+              file_delegate_count = 0
+
+              for idx, name_a, name_b in file_groups:
+                  if name_a in claimed or name_b in claimed:
+                      skipped.append((idx, name_a, name_b,
+                                       "conflicts with another selected item sharing a function -- "
+                                       "apply this one separately after the first lands"))
+                      continue
+
+                  fn_a, fn_b = by_name.get(name_a), by_name.get(name_b)
+                  if not fn_a or not fn_b:
+                      skipped.append((idx, name_a, name_b, "could not locate current code for one or both methods"))
+                      continue
+
+                  try:
+                      all_functions = [{"name": fn["name"], "code": fn["code"]} for fn in by_name.values()]
+                      payload = json.dumps({
+                          "nameA": name_a, "codeA": fn_a["code"],
+                          "nameB": name_b, "codeB": fn_b["code"],
+                          "allFunctions": all_functions
+                      }).encode()
+                      suggest_headers = {"Content-Type": "application/json"}
+                      if CLONEGUARD_API_KEY:
+                          suggest_headers["Authorization"] = f"Bearer {CLONEGUARD_API_KEY}"
+                      req = urllib.request.Request(
+                          f"{CLONEGUARD_URL}/suggest", data=payload,
+                          headers=suggest_headers, method="POST"
+                      )
+                      with urllib.request.urlopen(req, timeout=30) as resp:
+                          suggestion = json.loads(resp.read().decode())
+                  except Exception as e:
+                      skipped.append((idx, name_a, name_b, f"suggestion request failed: {e}"))
+                      continue
+
+                  if not suggestion.get("available"):
+                      skipped.append((idx, name_a, name_b, suggestion.get("reason", "no longer applicable")))
+                      continue
+
+                  technique = suggestion.get("technique", "extract")
+                  if technique == "delegation":
+                      rewritten_name = suggestion.get("rewrites", name_b)
+                      target_fn = fn_a if rewritten_name == name_a else fn_b
+                      edits.append((target_fn["start"], target_fn["end"], suggestion["newDuplicateBody"]))
+                      file_delegate_count += 1
+                  else:
+                      edits.append((fn_a["start"], fn_a["end"], suggestion["newCanonicalBody"]))
+                      edits.append((fn_b["start"], fn_b["end"],
+                                    suggestion["newDuplicateBody"] + "\n\n" + suggestion["helperCode"]))
+                      file_extract_count += 1
+
+                  claimed.add(name_a)
+                  claimed.add(name_b)
+                  applied.append((idx, name_a, name_b, technique, suggestion.get("note")))
+
+              if edits:
+                  edits.sort(key=lambda e: e[0], reverse=True)
+                  new_content = content
+                  for start, end, replacement in edits:
+                      new_content = new_content[:start] + replacement + new_content[end:]
+                  with open(filepath, 'w', encoding='utf-8') as f:
+                      f.write(new_content)
+
+                  # NEW (Scenario 3 dashboard support): record this file's
+                  # before/after line counts now, while both versions of
+                  # its content are still in scope -- matches
+                  # RefactorSession.fileName's existing "simple filename"
+                  # convention (os.path.basename, not the full repo-
+                  # relative path), same granularity the plugin side
+                  # already uses everywhere else in MetricsTrackerService.
+                  pr_log_entries.append({
+                      "timestamp": int(time.time() * 1000),
+                      "fileName": os.path.basename(filepath),
+                      "source": "github_pr",
+                      "pullRequestNumber": int(PR_NUMBER),
+                      "locBefore": len(content.splitlines()),
+                      "locAfter": len(new_content.splitlines()),
+                      "duplicatedLinesEliminated": max(0, len(content.splitlines()) - len(new_content.splitlines())),
+                      "extractCount": file_extract_count,
+                      "delegateCount": file_delegate_count,
+                      "pullUpCount": 0,
+                      "pushDownCount": 0,
+                      "understandAvailable": False,
+                  })
+
+          if not applied:
+              body = "**CloneGuard** — none of the selected clones could be applied:\n\n"
+              for idx, a, b, reason in skipped:
+                  body += f"- ⏭️ #{idx} `{a}()` ↔ `{b}()`: {reason}\n"
+              gh_request(f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+                         method="POST", body={"body": body})
+              print("Nothing applied.")
+              exit(0)
+
+          # NEW (Scenario 3 dashboard support): persist the accumulated
+          # log entries to .cloneguard/pr-refactor-log.json, merging with
+          # whatever's already there rather than overwriting -- this file
+          # is meant to accumulate across every PR that ever runs
+          # /refactor, not just the most recent one. Written and staged
+          # BEFORE the git commit below, in the SAME commit as the code
+          # fix itself, so the plugin-side import (see
+          # MetricsTrackerService.importGithubPrSessionsIfPresent()) has
+          # exactly one place to look, and every historical entry stays
+          # traceable to the commit that produced it.
+          if pr_log_entries:
+              os.makedirs(os.path.dirname(PR_METRICS_LOG_PATH), exist_ok=True)
+              existing_entries = []
+              if os.path.exists(PR_METRICS_LOG_PATH):
+                  try:
+                      with open(PR_METRICS_LOG_PATH, 'r', encoding='utf-8') as f:
+                          existing_entries = json.load(f)
+                      if not isinstance(existing_entries, list):
+                          existing_entries = []
+                  except Exception as e:
+                      print(f"Warning: could not read existing PR metrics log, starting fresh: {e}")
+                      existing_entries = []
+              existing_entries.extend(pr_log_entries)
+              with open(PR_METRICS_LOG_PATH, 'w', encoding='utf-8') as f:
+                  json.dump(existing_entries, f, indent=2)
+              print(f"Recorded {len(pr_log_entries)} new entry/entries to {PR_METRICS_LOG_PATH}")
+
+          subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+          subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=True)
+          subprocess.run(["git", "add", "-A"], check=True)
+          applied_ids = ", ".join(f"#{idx}" for idx, *_ in applied)
+          subprocess.run(["git", "commit", "-m", f"Apply selected refactors ({applied_ids}) via /refactor"], check=True)
+          subprocess.run(["git", "push"], check=True)
+
+          body = f"**CloneGuard** — applied {len(applied)} refactor(s):\n\n"
+          for idx, a, b, tech, note in applied:
+              label = "Method Delegation" if tech == "delegation" else "Extract Method"
+              body += f"- ✅ #{idx} `{a}()` ↔ `{b}()` ({label})\n"
+              if note:
+                  body += f"  - ℹ️ {note}\n"
+          if skipped:
+              body += "\nSkipped:\n"
+              for idx, a, b, reason in skipped:
+                  body += f"- ⏭️ #{idx} `{a}()` ↔ `{b}()`: {reason}\n"
+          body += "\nA fresh scan will run automatically on this push -- check back for an updated checklist."
+
+          # NEW (Scenario 3 dashboard, no-IDE version): a real dashboard
+          # rendered directly in the PR comment itself -- built from the
+          # SAME pr_log_entries this run just wrote, plus existing_entries
+          # (the full accumulated history across every /refactor comment
+          # ever resolved in this repo, already loaded and merged a few
+          # lines above when the log file was written). Deliberately
+          # entirely self-contained here: a reviewer sees real, current
+          # numbers on the PR itself, with no dependency on anyone having
+          # CloneGuard open locally, or even having the plugin installed
+          # at all -- this is the direct answer to "no IDE involved".
+          #
+          # SciTools Understand metrics (CC/WMC/CBO/DIT/NOC) are
+          # explicitly and honestly NOT shown here, for the same reason
+          # they're left out of pr_log_entries above: Understand isn't
+          # installed/licensed on this GitHub Actions runner, and showing
+          # fabricated numbers instead of an honest gap would be worse
+          # than not showing this section at all.
+          this_pr_files = len(pr_log_entries)
+          this_pr_loc_before = sum(e["locBefore"] for e in pr_log_entries)
+          this_pr_loc_after = sum(e["locAfter"] for e in pr_log_entries)
+          this_pr_lines_eliminated = sum(e["duplicatedLinesEliminated"] for e in pr_log_entries)
+          this_pr_extract = sum(e["extractCount"] for e in pr_log_entries)
+          this_pr_delegate = sum(e["delegateCount"] for e in pr_log_entries)
+
+          body += "\n\n---\n"
+          body += "### 📊 CloneGuard Dashboard — this Pull Request\n\n"
+          body += "| Metric | Value |\n|---|---|\n"
+          body += f"| Files changed | {this_pr_files} |\n"
+          body += f"| Lines of code (before → after) | {this_pr_loc_before} → {this_pr_loc_after} |\n"
+          body += f"| Duplicated lines eliminated | {this_pr_lines_eliminated} |\n"
+          body += f"| Extract Method applied | {this_pr_extract} |\n"
+          body += f"| Method Delegation applied | {this_pr_delegate} |\n"
+
+          body += ("\n*Cyclomatic Complexity, WMC, Coupling, and Inheritance metrics aren't available in this "
+                    "environment (SciTools Understand isn't installed on this runner) -- open the file locally in "
+                    "IntelliJ with CloneGuard for the full metric set.*")
+
+          gh_request(f"https://api.github.com/repos/{REPO}/issues/{PR_NUMBER}/comments",
+                     method="POST", body={"body": body})
+          print(f"Applied {len(applied)}, skipped {len(skipped)}.")
+          PYTHON
