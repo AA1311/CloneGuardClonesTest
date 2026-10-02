@@ -1,0 +1,20 @@
+public class SearchHelper {
+
+    public boolean contains(int[] numbers, int target) {
+        for (int number : numbers) {
+            if (number == target) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean containsCopy(int[] numbers, int target) {
+        for (int number : numbers) {
+            if (number == target) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
